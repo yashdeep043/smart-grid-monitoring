@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database (local instance)
+*.db
+smart_grid.db
+
+# Environments
+.env
+env/
+venv/
+ENV/
+
+# IDE & OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Build scripts / scratch
+build_master_docx.py
+compile_complete_master_docx.py
+compile_final_clean_master_docx.py
