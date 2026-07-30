@@ -208,7 +208,22 @@ is_telemetry_active = (st.session_state.get('nav_menu', '⚡ Real-Time Telemetry
 if menu == "⚡ Real-Time Telemetry":
     st.markdown("<div class='section-header'>⚡ ESP32 Sensor Telemetry Monitor</div>", unsafe_allow_html=True)
     
-    @st.fragment(run_every=f"{refresh_sec}s" if (auto_refresh and is_telemetry_active) else None)
+    # 1. Static Time Window Selector (Outside 1s fragment loop -> ZERO layout flickering)
+    col_selector_l, col_selector_r = st.columns([3, 1])
+    with col_selector_l:
+        time_range = st.radio(
+            "⏱️ **Select Telemetry Time Window**",
+            ["Live Stream (Real-Time)", "Last 15 Mins", "Last 1 Hour", "Last 6 Hours", "Last 24 Hours"],
+            horizontal=True, key="time_range_select"
+        )
+    with col_selector_r:
+        st.caption("ℹ️ *Downsampled automatically for long ranges to maintain high performance.*")
+
+    st.markdown("<div style='margin-bottom: 8px;'></div>", unsafe_allow_html=True)
+    is_live_selected = (time_range == "Live Stream (Real-Time)")
+    
+    # 2. Smooth Live Telemetry Data Fragment
+    @st.fragment(run_every=f"{refresh_sec}s" if (auto_refresh and is_telemetry_active and is_live_selected) else None)
     def render_telemetry_stream():
         if st.session_state.get('nav_menu') != "⚡ Real-Time Telemetry":
             return
@@ -238,12 +253,22 @@ if menu == "⚡ Real-Time Telemetry":
         imb_col = '#f85149' if imbalance_pct >= 2.0 else '#3fb950'
         imb_status = "⚠️ UNBALANCED (>2%)" if imbalance_pct >= 2.0 else "🟢 BALANCED (<2%)"
         
-        # Automatically surface imbalance event in AI Anomalies table if threshold crossed
+        # Automatically surface imbalance event in AI Anomalies table if threshold crossed (60s cooldown per node)
         if imbalance_pct >= 2.0:
             desc = f"WARNING: Phase Imbalance ({imbalance_pct:.2f}%) Exceeds 2% Limit (V_A={v_a:.1f}V, V_B={v_b:.1f}V, V_C={v_c:.1f}V)"
-            anom_df = db.get_all_anomalies()
-            recent_desc = anom_df['description'].head(5).values if not anom_df.empty else []
-            if desc not in recent_desc:
+            last_anomaly_ts = db.get_latest_anomaly_timestamp(node_id, "WARNING: Phase Imbalance%")
+            should_log = False
+            if last_anomaly_ts is None:
+                should_log = True
+            else:
+                try:
+                    last_dt = datetime.strptime(last_anomaly_ts, '%Y-%m-%d %H:%M:%S')
+                    if (datetime.now() - last_dt).total_seconds() >= 60:
+                        should_log = True
+                except Exception:
+                    should_log = True
+
+            if should_log:
                 db.log_anomaly(node_id, v_a, i_a, round(-0.70 - (imbalance_pct / 100.0), 3), desc)
 
         # Threshold checks for voltage and current (Nominal V: 230V, Normal V range: 218.5V-241.5V; Normal I max: 30A)
@@ -313,17 +338,6 @@ if menu == "⚡ Real-Time Telemetry":
             st.warning(f"⚠️ **VOLTAGE PHASE IMBALANCE ALERT**: Current voltage deviation is **{imbalance_pct:.2f}%** ($V_A$: {v_a:.1f}V, $V_B$: {v_b:.1f}V, $V_C$: {v_c:.1f}V). Threshold is 2.0%. Event logged to AI Anomalies table.")
 
         st.markdown("<hr>", unsafe_allow_html=True)
-        
-        # 3. TIME-RANGE SELECTOR & HISTORICAL DOWNSAMPLING
-        col_selector_l, col_selector_r = st.columns([3, 1])
-        with col_selector_l:
-            time_range = st.radio(
-                "⏱️ **Select Telemetry Time Window**",
-                ["Live Stream (Real-Time)", "Last 15 Mins", "Last 1 Hour", "Last 6 Hours", "Last 24 Hours"],
-                horizontal=True, key="time_range_select"
-            )
-        with col_selector_r:
-            st.caption("ℹ️ *Downsampled automatically for long ranges to maintain high performance.*")
 
         # RENDER WAVEFORM CHARTS
         def render_waveform_charts(selected_range, active_node):
@@ -338,27 +352,29 @@ if menu == "⚡ Real-Time Telemetry":
             # Direct database query inside fragment for Live Stream and historical ranges
             if selected_range == "Live Stream (Real-Time)":
                 df_chart = pd.read_sql_query(
-                    "SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 100",
+                    "SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 30",
                     conn, params=[active_node]
                 ).sort_values('id')
             elif selected_range == "Last 15 Mins":
                 cutoff = (ref_dt - timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
-                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC", conn, params=[active_node, cutoff])
+                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC LIMIT 150", conn, params=[active_node, cutoff])
+                if len(df_chart) < 10:
+                    df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 150", conn, params=[active_node]).sort_values('id')
             elif selected_range == "Last 1 Hour":
                 cutoff = (ref_dt - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC", conn, params=[active_node, cutoff])
-                if len(df_chart) > 100:
-                    df_chart = df_chart.iloc[::2].copy()
+                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC LIMIT 300", conn, params=[active_node, cutoff])
+                if len(df_chart) < 10:
+                    df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 300", conn, params=[active_node]).sort_values('id')
             elif selected_range == "Last 6 Hours":
                 cutoff = (ref_dt - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
-                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC", conn, params=[active_node, cutoff])
-                if len(df_chart) > 100:
-                    df_chart = df_chart.iloc[::6].copy()
+                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC LIMIT 600", conn, params=[active_node, cutoff])
+                if len(df_chart) < 10:
+                    df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 600", conn, params=[active_node]).sort_values('id')
             else: # Last 24 Hours
                 cutoff = (ref_dt - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC", conn, params=[active_node, cutoff])
-                if len(df_chart) > 100:
-                    df_chart = df_chart.iloc[::15].copy()
+                df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? AND timestamp >= ? ORDER BY id ASC LIMIT 1200", conn, params=[active_node, cutoff])
+                if len(df_chart) < 10:
+                    df_chart = pd.read_sql_query("SELECT * FROM telemetry WHERE node_id = ? ORDER BY id DESC LIMIT 1200", conn, params=[active_node]).sort_values('id')
             conn.close()
 
             if df_chart.empty:
@@ -421,7 +437,8 @@ if menu == "⚡ Real-Time Telemetry":
                 title_text="Voltage (V)", title_font=dict(color=plotly_font, size=11),
                 tickfont=dict(color=plotly_font, size=10)
             )
-            col_charts_l.plotly_chart(fig_v, use_container_width=True, key="fig_v_live_placeholder")
+            key_v = f"fig_v_{selected_range.lower().replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')}"
+            col_charts_l.plotly_chart(fig_v, use_container_width=True, key=key_v, config={'displayModeBar': False, 'responsive': True})
 
             # -----------------------------------------------------
             # CURRENT WAVEFORM CHART
@@ -482,7 +499,8 @@ if menu == "⚡ Real-Time Telemetry":
                 showgrid=False, title_text="Power Factor", title_font=dict(color="#00b0ff", size=11),
                 tickfont=dict(color="#00b0ff", size=10), secondary_y=True
             )
-            col_charts_r.plotly_chart(fig_i, use_container_width=True, key="fig_i_live_placeholder")
+            key_i = f"fig_i_{selected_range.lower().replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')}"
+            col_charts_r.plotly_chart(fig_i, use_container_width=True, key=key_i, config={'displayModeBar': False, 'responsive': True})
 
         # Execute self-contained chart fragment
         render_waveform_charts(time_range, node_id)

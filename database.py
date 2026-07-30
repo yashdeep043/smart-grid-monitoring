@@ -79,10 +79,10 @@ def init_db():
     
     conn.commit()
     
-    # Check if empty; if so, seed historical demo data for dashboard immediate readiness
+    # Check if empty or sparse; if so, seed historical demo data for dashboard immediate readiness
     cursor.execute("SELECT COUNT(*) FROM telemetry")
     count = cursor.fetchone()[0]
-    if count == 0:
+    if count < 100:
         seed_historical_data(conn)
         
     conn.close()
@@ -202,6 +202,18 @@ def get_all_anomalies():
     df = pd.read_sql_query("SELECT * FROM anomalies ORDER BY id DESC", conn)
     conn.close()
     return df
+
+def get_latest_anomaly_timestamp(node_id, description_prefix="WARNING: Phase Imbalance%"):
+    """Return the timestamp string of the most recent anomaly matching node_id and description_prefix, or None."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT timestamp FROM anomalies WHERE node_id = ? AND description LIKE ? ORDER BY id DESC LIMIT 1",
+        (node_id, description_prefix)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def log_powerflow_result(mode, total_load_mw, solar_gen_mw, total_loss_kw, min_voltage_pu, max_line_loading_pct, status, violations):
     conn = get_connection()
