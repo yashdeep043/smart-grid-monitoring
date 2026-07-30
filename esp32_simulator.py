@@ -35,14 +35,23 @@ def generate_sensor_data(node_id="ESP32_SUBSTATION_01"):
     
     pf = round(random.uniform(0.91, 0.98), 2)
     
-    # Inject synthetic fault/sag on 5% probability for live demo excitement
+    # Inject synthetic fault/sag/imbalance on small probabilities for live demo
     status = "NORMAL"
-    if random.random() < 0.05:
+    rand_val = random.random()
+    if rand_val < 0.05:
         v_a *= 0.78
         status = "VOLTAGE_SAG"
-    elif random.random() < 0.02:
+    elif rand_val < 0.07:
         i_a *= 3.5
         status = "OVERCURRENT_SPIKE"
+    elif rand_val < 0.12:
+        # Phase imbalance: Phase B voltage sags slightly and Phase C current spikes
+        v_b *= 0.94
+        v_c *= 1.03
+        i_a *= 1.25
+        i_c *= 0.78
+        status = "PHASE_IMBALANCE"
+
 
     p_kw = round((v_a * i_a + v_b * i_b + v_c * i_c) * pf / 1000.0, 2)
     q_kvar = round(p_kw * math.tan(math.acos(pf)), 2)
@@ -77,9 +86,9 @@ def run_simulator(interval_sec=5, max_loops=None):
                 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "ESP32_Grid_Simulator")
             else:
                 client = mqtt.Client("ESP32_Grid_Simulator")
-            client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=60)
             client.loop_start()
-            print(f"Connected to MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+            print(f"Connecting to MQTT Broker in background: {MQTT_BROKER}:{MQTT_PORT}")
         except Exception as e:
             print(f"MQTT Broker Connection Note: {e} (Continuing with direct SQLite database logging)")
             client = None

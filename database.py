@@ -61,6 +61,22 @@ def init_db():
         )
     ''')
     
+    # Power Flow History Table (Time-series Pandapower runs)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS powerflow_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            mode TEXT,
+            total_load_mw REAL,
+            solar_gen_mw REAL,
+            total_loss_kw REAL,
+            min_voltage_pu REAL,
+            max_line_loading_pct REAL,
+            status TEXT,
+            violations TEXT
+        )
+    ''')
+    
     conn.commit()
     
     # Check if empty; if so, seed historical demo data for dashboard immediate readiness
@@ -187,6 +203,53 @@ def get_all_anomalies():
     conn.close()
     return df
 
+def log_powerflow_result(mode, total_load_mw, solar_gen_mw, total_loss_kw, min_voltage_pu, max_line_loading_pct, status, violations):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO powerflow_history 
+        (timestamp, mode, total_load_mw, solar_gen_mw, total_loss_kw, min_voltage_pu, max_line_loading_pct, status, violations)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), mode, total_load_mw, solar_gen_mw, total_loss_kw, min_voltage_pu, max_line_loading_pct, status, violations))
+    conn.commit()
+    conn.close()
+
+def get_powerflow_history(limit=60):
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM powerflow_history ORDER BY id DESC LIMIT ?", conn, params=[limit])
+    conn.close()
+    return df
+
+def get_telemetry_baseline_load(limit=10):
+    """
+    Query recent active power readings from telemetry table.
+    Returns:
+        dict containing average active_power (kW), nominal baseline MW (for Pandapower),
+        and ratio relative to nominal base grid load (5.45 MW).
+    """
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT active_power FROM telemetry ORDER BY id DESC LIMIT ?", conn, params=[limit])
+    conn.close()
+    
+    if df.empty or 'active_power' not in df.columns:
+        return {'avg_power_kw': 25.0, 'live_load_mw': 5.45, 'baseline_scaling': 1.0}
+        
+    avg_power_kw = float(df['active_power'].mean())
+    # Baseline grid nominal load is 5.45 MW.
+    # Telemetry active_power represents localized feeder sample (around 20-35 kW nominal).
+    # Baseline scaling ratio = avg_power_kw / 25.0 (25 kW standard baseline).
+    baseline_scaling = round(avg_power_kw / 25.0, 2)
+    baseline_scaling = max(min(baseline_scaling, 3.0), 0.3)
+    live_load_mw = round(5.45 * baseline_scaling, 2)
+    
+    return {
+        'avg_power_kw': round(avg_power_kw, 2),
+        'live_load_mw': live_load_mw,
+        'baseline_scaling': baseline_scaling
+    }
+
 if __name__ == "__main__":
     init_db()
     print("Database initialized and seeded successfully.")
+    print("Baseline:", get_telemetry_baseline_load())
+

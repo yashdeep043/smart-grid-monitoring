@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import database as db
 
 try:
     import pandapower as pp
@@ -72,13 +73,19 @@ class GridSimulator:
         
         self.net = net
 
-    def run_power_flow(self, load_scaling=1.0, solar_generation_mw=0.8):
-        """Execute AC Power Flow Newton-Raphson simulation."""
+    def run_power_flow(self, load_scaling=1.0, solar_generation_mw=0.8, use_telemetry_baseline=True, auto_log_anomalies=True):
+        """Execute AC Power Flow simulation with live baseline telemetry scaling and auto-alerting."""
+        # Query SQLite live baseline
+        baseline = db.get_telemetry_baseline_load() if use_telemetry_baseline else {'avg_power_kw': 25.0, 'live_load_mw': 5.45, 'baseline_scaling': 1.0}
+        
+        # Effective scaling = user multiplier * live telemetry baseline ratio
+        effective_scaling = load_scaling * baseline['baseline_scaling'] if use_telemetry_baseline else load_scaling
+        
         if not PANDAPOWER_AVAILABLE or self.net is None:
-            return self._fallback_simulation(load_scaling, solar_generation_mw)
+            return self._fallback_simulation(effective_scaling, solar_generation_mw, baseline, auto_log_anomalies)
             
         # Update dynamic parameters
-        self.net.load['scaling'] = load_scaling
+        self.net.load['scaling'] = effective_scaling
         if len(self.net.sgen) > 0:
             self.net.sgen.loc[0, 'p_mw'] = solar_generation_mw
             
@@ -110,6 +117,34 @@ class GridSimulator:
             })
             
             total_loss_kw = float((self.net.res_line['pl_mw'].sum() + self.net.res_trafo['pl_mw'].sum()) * 1000)
+            min_voltage_pu = float(self.net.res_bus['vm_pu'].min())
+            max_line_loading_pct = float(self.net.res_line['loading_percent'].max())
+            
+            most_stressed_line_idx = self.net.res_line['loading_percent'].idxmax()
+            most_stressed_line = str(self.net.line.loc[most_stressed_line_idx, 'name'])
+            
+            min_v_idx = self.net.res_bus['vm_pu'].idxmin()
+            most_stressed_node = str(self.net.bus.loc[min_v_idx, 'name'])
+            
+            violations = []
+            if min_voltage_pu < 0.95:
+                violations.append(f"Voltage Undervoltage ({min_voltage_pu:.3f} p.u. at {most_stressed_node})")
+            elif min_voltage_pu > 1.05:
+                violations.append(f"Voltage Overvoltage ({min_voltage_pu:.3f} p.u.)")
+                
+            if max_line_loading_pct > 90.0:
+                violations.append(f"Line Thermal Overload ({max_line_loading_pct:.1f}% on {most_stressed_line})")
+                
+            # Log anomalies automatically into SQLite anomalies table
+            if auto_log_anomalies and len(violations) > 0:
+                for v_msg in violations:
+                    db.log_anomaly(
+                        node_id=most_stressed_node,
+                        v=round(min_voltage_pu * 230.0, 1),
+                        i=round(max_line_loading_pct * 0.5, 1),
+                        score=-0.88,
+                        description=f"POWER FLOW ALERTS: {v_msg}"
+                    )
             
             return {
                 'success': True,
@@ -117,15 +152,25 @@ class GridSimulator:
                 'lines': lines_df,
                 'total_loss_kw': round(total_loss_kw, 2),
                 'total_load_mw': round(float(self.net.res_load['p_mw'].sum()), 2),
-                'solar_gen_mw': solar_generation_mw
+                'solar_gen_mw': solar_generation_mw,
+                'effective_scaling': round(effective_scaling, 2),
+                'telemetry_baseline': baseline,
+                'min_voltage_pu': round(min_voltage_pu, 4),
+                'max_line_loading_pct': round(max_line_loading_pct, 2),
+                'most_stressed_line': most_stressed_line,
+                'most_stressed_node': most_stressed_node,
+                'violations': violations
             }
             
         except Exception as e:
             print(f"Pandapower solver error: {e}")
-            return self._fallback_simulation(load_scaling, solar_generation_mw)
+            return self._fallback_simulation(effective_scaling, solar_generation_mw, baseline, auto_log_anomalies)
 
-    def _fallback_simulation(self, load_scaling, solar_mw):
+    def _fallback_simulation(self, load_scaling, solar_mw, baseline=None, auto_log_anomalies=True):
         """Analytical fallback if pandapower solver fails or is uninstalled."""
+        if baseline is None:
+            baseline = {'avg_power_kw': 25.0, 'live_load_mw': 5.45, 'baseline_scaling': 1.0}
+            
         bus_names = [
             "Grid Substation 110kV", "Substation 11kV", "Feeder Node A (Industrial)",
             "Feeder Node B (Commercial)", "Feeder Node C (Residential)", 
@@ -156,13 +201,41 @@ class GridSimulator:
             'Overloaded': [52.4 * load_scaling > 90.0, 41.1 * load_scaling > 90.0, 38.6 * load_scaling > 90.0]
         })
         
+        min_voltage_pu = float(min(v_pu))
+        max_line_loading_pct = float(max(lines_df['Loading (%)']))
+        most_stressed_line = lines_df.loc[lines_df['Loading (%)'].idxmax(), 'Line Name']
+        most_stressed_node = buses_df.loc[buses_df['Voltage (p.u.)'].idxmin(), 'Bus Name']
+        
+        violations = []
+        if min_voltage_pu < 0.95:
+            violations.append(f"Voltage Undervoltage ({min_voltage_pu:.3f} p.u. at {most_stressed_node})")
+        if max_line_loading_pct > 90.0:
+            violations.append(f"Line Thermal Overload ({max_line_loading_pct:.1f}% on {most_stressed_line})")
+            
+        if auto_log_anomalies and len(violations) > 0:
+            for v_msg in violations:
+                db.log_anomaly(
+                    node_id=most_stressed_node,
+                    v=round(min_voltage_pu * 230.0, 1),
+                    i=round(max_line_loading_pct * 0.5, 1),
+                    score=-0.88,
+                    description=f"POWER FLOW ALERTS: {v_msg}"
+                )
+        
         return {
             'success': True,
             'buses': buses_df,
             'lines': lines_df,
             'total_loss_kw': round(44.8 * (load_scaling**2), 2),
             'total_load_mw': round(5.45 * load_scaling, 2),
-            'solar_gen_mw': solar_mw
+            'solar_gen_mw': solar_mw,
+            'effective_scaling': round(load_scaling, 2),
+            'telemetry_baseline': baseline,
+            'min_voltage_pu': round(min_voltage_pu, 4),
+            'max_line_loading_pct': round(max_line_loading_pct, 2),
+            'most_stressed_line': most_stressed_line,
+            'most_stressed_node': most_stressed_node,
+            'violations': violations
         }
 
 if __name__ == "__main__":

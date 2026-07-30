@@ -43,6 +43,15 @@ class SmartGridAI:
         if pf < 0.75:
             return True, -0.65, "WARNING: Low Power Factor (<0.75) Reactive Power Loss"
             
+        # Check 3-phase voltage imbalance (NEMA standard: max deviation from avg / avg * 100%)
+        v_avg = (v_a + v_b + v_c) / 3.0
+        if v_avg > 0:
+            v_dev = max(abs(v_a - v_avg), abs(v_b - v_avg), abs(v_c - v_avg))
+            v_imb = (v_dev / v_avg) * 100.0
+            if v_imb >= 2.0:
+                return True, round(-0.70 - (v_imb / 100.0), 3), f"WARNING: Phase Imbalance ({v_imb:.2f}%) Exceeds 2% Limit"
+
+            
         if self.is_anomaly_fitted:
             features = np.array([[v_a, v_b, v_c, i_a, i_b, i_c, pf]])
             pred = self.anomaly_model.predict(features)[0] # -1 for anomaly, 1 for normal
@@ -97,9 +106,20 @@ class SmartGridAI:
         
         return forecast_df
 
+    def get_forecast_load_multiplier(self, df_telemetry=None):
+        """Compute upcoming forecasted peak/average load multiplier relative to 25kW baseline."""
+        fc_df = self.forecast_next_24h(df_telemetry)
+        if fc_df.empty:
+            return 1.2
+        next_4h_avg = float(fc_df['Forecasted Load (kW)'].head(4).mean())
+        multiplier = round(next_4h_avg / 25.0, 2)
+        return max(min(multiplier, 2.5), 0.5)
+
 if __name__ == "__main__":
     ai = SmartGridAI()
     sample_packet = {'voltage_a': 165.0, 'voltage_b': 230.0, 'voltage_c': 230.0, 'current_a': 15.0, 'current_b': 10.0, 'current_c': 10.0, 'power_factor': 0.92}
     is_anom, score, desc = ai.predict_anomaly(sample_packet)
     print(f"Anomaly Check: {is_anom} | Score: {score} | Description: {desc}")
     print(ai.forecast_next_24h().head())
+    print("Forecast Multiplier:", ai.get_forecast_load_multiplier())
+
