@@ -256,7 +256,23 @@ if menu == "⚡ Real-Time Telemetry":
         # Automatically surface imbalance event in AI Anomalies table if threshold crossed (60s cooldown per node)
         if imbalance_pct >= 2.0:
             desc = f"WARNING: Phase Imbalance ({imbalance_pct:.2f}%) Exceeds 2% Limit (V_A={v_a:.1f}V, V_B={v_b:.1f}V, V_C={v_c:.1f}V)"
-            last_anomaly_ts = db.get_latest_anomaly_timestamp(node_id, "WARNING: Phase Imbalance%")
+            last_anomaly_ts = None
+            try:
+                if hasattr(db, 'get_latest_anomaly_timestamp'):
+                    last_anomaly_ts = db.get_latest_anomaly_timestamp(node_id, "WARNING: Phase Imbalance%")
+                else:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT timestamp FROM anomalies WHERE node_id = ? AND description LIKE 'WARNING: Phase Imbalance%' ORDER BY id DESC LIMIT 1",
+                        (node_id,)
+                    )
+                    row = cursor.fetchone()
+                    conn.close()
+                    last_anomaly_ts = row[0] if row else None
+            except Exception:
+                last_anomaly_ts = None
+
             should_log = False
             if last_anomaly_ts is None:
                 should_log = True
